@@ -1,4 +1,6 @@
+import datetime
 import json
+import re
 import urllib.parse
 import requests
 from re import sub
@@ -6,6 +8,13 @@ from re import sub
 from . import urls
 from .account_information import Position, Account
 from .authentication import SessionManager
+
+
+def _get_current_shares(account_summary):
+    # Filter out un-sellable symbols
+    current_shares = {position['symbol']: position['quantity'] for position in account_summary['positions']
+                      if re.match(r"^[-A-Z]+$", position['symbol'])}
+    return current_shares
 
 
 class Schwab(SessionManager):
@@ -121,13 +130,14 @@ class Schwab(SessionManager):
 
     def trade(self, ticker, side, qty, account_id, dry_run=True, reinvest=True, tax_optimized_cost_basis=True):
         """
-            ticker (Str) - The symbol you want to trade,
+            ticker (str) - The ticker symbol to trade,
             side (str) - Either 'Buy' or 'Sell',
             qty (float) - The amount of shares to buy/sell,
             account_id (int) - The account ID to place the trade on. If the ID is XXXX-XXXX,
                          we're looking for just XXXXXXXX,
-            reinvest (boolean) - Reinvest dividends,
-            tax_optimized_cost_basis (boolean) - Use tax optimized cost-basis strategy, as opposed to FIFO.
+            dry_run (bool) - Dry run, don't actually perform trades,
+            reinvest (bool) - Reinvest dividends,
+            tax_optimized_cost_basis (bool) - Use tax optimized cost-basis strategy, as opposed to FIFO.
 
             Returns messages (list of strings), is_success (boolean)
         """
@@ -170,6 +180,8 @@ class Schwab(SessionManager):
         if dry_run:
             return messages, True
 
+        short_description = urllib.parse.quote_plus(response['IssueShortDescription']) \
+            if response['IssueShortDescription'] is not None else ''
         payload = {
             "AccountId": str(account_id),
             "ActionType": side,
@@ -184,7 +196,7 @@ class Schwab(SessionManager):
             "OrderType": "Market",
             "Principal": response['QuoteAmount'],
             "Quantity": str(qty),
-            "ShortDescription": urllib.parse.quote_plus(response['IssueShortDescription']),
+            "ShortDescription": short_description,
             "Symbol": response["IssueSymbol"],
             "Timing": "Day Only"
         }
@@ -204,30 +216,94 @@ class Schwab(SessionManager):
 
         return messages, False
 
+    def get_current_prices(self, symbols: list[str]) -> dict[str, float]:
+        """Get current prices
+        :param symbols: list[str]
+        """
+        quotations, success = self.quote_v2(symbols)
+        prices = {}
+        if success:
+            for quotation in quotations:
+                prices[quotation['symbol']] = float(sub(r'[^\d.]', '', quotation['quote']['last']))
+        return prices
+
     def get_current_price(self, ticker: str) -> float:
-        quotation = self.quote_v2([ticker])[0]
-        return float(sub(r'[^\d.]', '', quotation['quote']['last']))
+        """Get current price
+        :param ticker: str
+        """
+        return self.get_current_prices([ticker]).get(ticker)
 
     def get_available_funds(self, account_id: int) -> float:
+        """Get cash funds available for purchases in the account
+        :param account_id:  int
+        """
         accounts = self.get_account_info_v2()
         return accounts[account_id]["available_cash"]
 
-    def rebalance(self, account_id: int, allocations: {}, set_aside=0.0, reinvest=True, tax_optimized_cost_basis=True,
-                  dry_run=True, sell_all_confirm=False) -> ([str], True):
+    def rebalance(self, account_id: int, allocations: dict[str, float], set_aside: float = 0.0,
+                  reinvest: bool = True, tax_optimized_cost_basis: bool = True, dry_run: bool = True,
+                  sell_all_confirm: bool = False) -> tuple[list[str], bool]:
+        """Rebalance account portfolio
+
+        Warning - this function performs equity trades that may have tax consequences.
+
+        Perform sales and purchases to achieve a desired proportional investment in a set of equities. For example,
+        lets say it's desired to have 33% of the account in Apple, 50% in Tesla, and the rest in IBM. The allocations
+        argument can be set to show the relative desired weighting as {'AAPL': 1.0, 'TSLA': 1.5, 'IBM': 0.5}. If the
+        account currently had 25% in Apple, 60% in Tesla, and 15% in Google, then all the Google stock would be sold,
+        some Tesla would be sold, some additional Apple stock would be purchased, and IBM would be purchased.
+
+        Because of the need to purchase in whole share units, the resulting holdings are approximations of the
+        desired holdings. Caller may specify an amount of cash to set aside in the account, in which case the desired
+        holding percentages apply to the balance after the set-aside. Once all transactions have occurred, if there is
+        enough cash remaining to purchase one or more shares of the least expensive desired stock, those will be
+        purchased as well, to minimize leftover cash.
+
+        The function returns a list of messages related to the sale and purchase transactions, and an indication of
+        its ultimate success. It may be the case that some, but not all the transactions succeed. In that case, the
+        function returns after the first unsuccessful transaction.
+
+        Parameters
+        ----------
+            account_id : int
+                The account ID to place the trades on
+            allocations : {str:float}
+                Symbols desired to have in the account, correlated to their relative weights -
+                for example: {'AAPL': 1.0, 'TSLA': 1.5, 'IBM': 0.5}
+            set_aside : float, optional
+                The amount of cash, in dollars, to set aside in the account during rebalancing, by default 0.0
+            reinvest : bool, optional
+                Reinvest dividends that occur into the equities that granted them, by default True
+            tax_optimized_cost_basis : bool, optional
+                Use tax-optimized cost-basis strategy, rather than FIFO, by default True
+            dry_run : bool, optional
+                Dry run, return potential trades and issues but don't actually perform trades, by default True
+            sell_all_confirm : bool, optional
+                Confirmation that an empty allocations argument indicates an intent to sell all holdings, by default
+                False
+
+        Returns
+        -------
+            result_summary : tuple(list[str], bool)
+                List of messages indicating the trades attempted and resulting messages returned by Schwab, followed by
+                True if all attempted trades were successful, otherwise the last attempted trade failed
+        """
+
+        if allocations is None:
+            allocations = {}
         account_info = self.get_account_info_v2()
         result_messages = []
         account = account_info[account_id]
         portfolio_value = account['account_value'] - set_aside
-        current_shares = {}
-        for position in account['positions']:
-            current_shares[position['symbol']] = position['quantity']
-
+        current_shares = _get_current_shares(account)
         desired_shares = {}
         cheapest = None
+        success = True
+
         if len(allocations) == 0:
             if not sell_all_confirm:
                 return ['Attempting to rebalance with no allocations. '
-                        'If that is the intent, set sell_all_confirm to True.'], True
+                        'If that is the intent, set sell_all_confirm to True.'], success
         else:
             total_allocation = 0.0
             for symbol in allocations:
@@ -235,11 +311,9 @@ class Schwab(SessionManager):
                     raise ValueError("Rebalance allocation for %s is less than zero." % symbol)
                 total_allocation += allocations[symbol]
 
-            prices = {}
+            prices = self.get_current_prices(list(allocations.keys()))
             lowest_price = 999999999.99
-            quotations = self.quote_v2(list(allocations.keys()))
-            for quotation in quotations:
-                prices[(symbol := quotation['symbol'])] = float(sub(r'[^\d.]', '', quotation['quote']['last']))
+            for symbol in prices:
                 if prices[symbol] < lowest_price:
                     lowest_price = prices[symbol]
                     cheapest = symbol
@@ -289,9 +363,37 @@ class Schwab(SessionManager):
 
         return result_messages, success
 
-    def sell(self, account_id, ticker, shares, tax_optimized_cost_basis=True, dry_run=True):
+    def sell(self, account_id: int, ticker: str, shares: float, tax_optimized_cost_basis: bool = True,
+             dry_run: bool = True) -> tuple[list[str], bool]:
+        """Sell shares
+
+        Warning - this function performs equity trades that may have tax consequences.
+
+        Perform sale of equity shares from a given account portfolio.
+
+        Parameters
+        ----------
+            account_id : int
+                The account ID in which to place the sale
+            ticker : str
+                The ticker symbol to sell
+            shares : float
+                Number of shares to sell
+            tax_optimized_cost_basis : bool, optional
+                Use tax-optimized cost-basis strategy, rather than FIFO, by default True
+            dry_run : bool, optional
+                Dry run, return potential sale and issues but don't actually perform sale, by default True
+
+        Returns
+        -------
+            result_summary :  tuple[list[str], bool]
+                List of messages indicating the attempted sale and resulting messages returned by Schwab, followed by
+                True if the attempted sale was successful
+        """
+
         result_messages = ["--> Selling from account %s: %f shares of %s" % (account_id, shares, ticker)]
         if shares <= 0:
+            # An attempt to sell zero shares is not a failure - zero shares are successfully (not) sold.
             return result_messages + ["Attempt to sell invalid number of shares: %f" % shares], shares == 0
         messages, success = self.trade(
             ticker=ticker,
@@ -304,8 +406,38 @@ class Schwab(SessionManager):
         result_messages += messages
         return result_messages, success
 
-    def purchase(self, account_id, ticker, shares=None, set_aside=0.00, reinvest=True, tax_optimized_cost_basis=True,
-                 dry_run=True):
+    def purchase(self, account_id: int, ticker: str, shares: float = None, set_aside: float = 0.00,
+                 reinvest: bool = True, tax_optimized_cost_basis: bool = True,
+                 dry_run: bool = True) -> tuple[list[str], bool]:
+        """Purchase shares
+
+        Perform purchase of equity shares within a given account portfolio. If the shares parameter is not provided,
+        purchase as many shares as possible with the available funds that haven't been set aside.
+
+        Parameters
+        ----------
+            account_id : int
+                The account ID in which to place the purchase
+            ticker : str
+                The ticker symbol to purchase
+            shares : float, optional
+                Number of shares to purchase, default None
+            set_aside : float, optional
+                The amount of cash, in dollars, to set aside in the account, by default 0.0
+            reinvest : bool, optional
+                Reinvest dividends that occur into the same equity, by default True
+            tax_optimized_cost_basis : bool, optional
+                Use tax-optimized cost-basis strategy, rather than FIFO, by default True
+            dry_run : bool, optional
+                Dry run, return potential purchase and issues but don't actually perform purchase, by default True
+
+        Returns
+        -------
+            result_summary :  tuple[list[str], bool]
+                List of messages indicating the attempted purchase and resulting messages returned by Schwab, followed
+                by True if the attempted purchase was successful
+        """
+
         result_intro_message = "<-- Purchase request for account %s of %s" % (account_id, ticker)
         if shares is None:
             result_intro_message += ", as many shares as possible"
@@ -333,6 +465,107 @@ class Schwab(SessionManager):
             dry_run=dry_run
         )
         result_messages += messages
+        if not success:
+            result_messages.append(f"Retrying purchase in account {account_id} using affirmation: {shares} shares of "
+                                   f"{ticker}")
+            messages, success = self.trade_v2(
+                ticker,
+                "Buy",
+                shares,
+                account_id,
+                affirm_order=True,
+                cost_basis='BTAX' if tax_optimized_cost_basis else 'FIFO',
+                reinvest=reinvest,
+                dry_run=dry_run,
+                valid_return_codes={0, 10, 20, 25}
+            )
+            result_messages += messages
+
+        return result_messages, success
+
+    def cancel_all_stop_loss_orders(self, account_id: int, dry_run: bool = True) -> tuple[list[str], bool]:
+        """Cancel all stop-loss orders
+
+        Cancels all pending stop-loss orders within a given account portfolio.
+
+        Parameters
+        ----------
+            account_id : int
+                The account ID in which to cancel stop-loss orders
+            dry_run : bool, optional
+                Dry run, return potential cancellation issues but don't actually perform them, by default True
+
+        Returns
+        -------
+            result_summary : tuple[list[str], bool]
+                List of messages indicating the attempted stop-loss cancellations and resulting messages returned by
+                Schwab, followed by True if the attempted set of cancellations was successful. Stops after first
+                failure.
+        """
+
+        response = self.orders_v2(account_id)
+        order_ids = []
+        for order_group in response:
+            order_ids += [order['OrderId'] for order in order_group['OrderList']
+                          if order['IsLiveOrder'] and order['OrderStatus'] == 'Open' and order['OrderAction'] ==
+                          'Sell' and order['Price'].startswith('Stop ')]
+        account_id_string = str(account_id)
+        succeeded = True
+        cancellation_results = []
+        for order_id in order_ids:
+            cancellation_results.append(f"Cancelling Stop Loss order {order_id} in account {account_id}")
+            response, cancel_success = \
+                self.cancel_order_v2(account_id_string, order_id) if not dry_run else "Dry run - not executed", True
+            cancellation_results.append(response)
+            succeeded = cancel_success
+            if not succeeded:
+                break
+        return cancellation_results, succeeded
+
+    def fractional_account_stop_loss(self, account_id: int, fraction: float,
+                                     dry_run: bool = True) -> tuple[list[str], bool]:
+        """Creates stop-loss orders at fraction of the current price
+
+        Creates 90-day stop-loss orders for each security in the account at the given fraction of the current price.
+
+        Parameters
+        ----------
+            account_id : int
+                The account ID in which to create stop-loss orders
+            fraction : float
+                The fraction of the current price at which to set the stop prices
+            dry_run : bool, optional
+                Dry run, return potential stop-loss order issues but don't actually perform them, by default True
+
+        Returns
+        -------
+            result_summary : tuple[list[str], bool]
+                List of messages indicating the attempted stop-loss orders and resulting messages returned by
+                Schwab, followed by True if the attempted set of orders was successful. Stops after first
+                failure.
+        """
+
+        if fraction == 0.0:
+            return [], True
+        if fraction >= 1.0 or fraction < 0.0:
+            raise ValueError(f"Stop-loss fraction ({fraction}) must be greater than or equal to 0, and less than 1.0")
+        account_info = self.get_account_info_v2()
+        account = account_info[account_id]
+        expiration_date = (datetime.datetime.now() + datetime.timedelta(days=90)).strftime("%m/%d/%Y")
+        current_shares = _get_current_shares(account)
+        prices = self.get_current_prices(list(current_shares.keys()))
+        result_messages = []
+        success = True
+        for ticker in current_shares:
+            stop_price = round(prices[ticker] * fraction, 2)
+            result_messages.append(f"Placing stop-loss order in account {account_id}: {current_shares[ticker]} shares "
+                                   f"of {ticker} at ${stop_price}")
+            messages, success = self.trade_v2(ticker, 'Sell', current_shares[ticker], account_id, dry_run=dry_run,
+                                              order_type=51, duration=49, expiration_date=expiration_date,
+                                              stop_price=stop_price, valid_return_codes={0, 10, 20})
+            result_messages += messages
+            if not success:
+                break
         return result_messages, success
 
     def trade_v2(self,
@@ -344,12 +577,14 @@ class Schwab(SessionManager):
                  # The Fields below are experimental fields that should only be changed if you know what you're doing.
                  order_type=49,
                  duration=48,
-                 limit_price=0,
-                 stop_price=0,
+                 limit_price=0.0,
+                 stop_price=0.0,
                  primary_security_type=46,
-                 valid_return_codes=None,
+                 valid_return_codes=None,  # Set to {0, 10} below
                  affirm_order=False,
-                 cost_basis='FIFO'
+                 cost_basis='FIFO',
+                 reinvest=False,
+                 expiration_date=None
                  ):
         """
             ticker (Str) - The symbol you want to trade,
@@ -405,7 +640,7 @@ class Schwab(SessionManager):
                         Setting this to True will likely provide the verification needed to execute
                         these orders. You will likely also have to include the appropriate return
                         code in valid_return_codes.
-            costBasis (str) - Set the cost basis for a sell order. Important tax implications. See:
+            cost_basis (str) - Set the cost basis for a sell order. Important tax implications. See:
                          https://help.streetsmart.schwab.com/edge/1.22/Content/Cost%20Basis%20Method.htm
                          Only tested FIFO and BTAX.
                         'FIFO': First In First Out
@@ -414,6 +649,8 @@ class Schwab(SessionManager):
                         'LIFO': Last In First Out
                         'BTAX': Tax Lot Optimizer
                         ('VSP': Specific Lots -> just for reference. Not implemented: Requires to select lots manually.)
+            reinvest - if purchasing, reinvest dividends that occur into the same equity, by default False
+            expiration_date - Required when duration is 49 - GTC Good till canceled. Of the form 'mm/dd/YYYY'
             Note: this function calls the new Schwab API, which is flakier and seems to have stricter authentication
             requirements.
             For now, only use this function if the regular trade function doesn't work for your use case.
@@ -430,7 +667,7 @@ class Schwab(SessionManager):
         else:
             raise Exception("side must be either Buy or Sell")
 
-        # Handling formating of limit_price to avoid error.
+        # Handling formatting of limit_price to avoid error.
         # Checking how many decimal places are in limit_price.
         decimal_places = len(str(float(limit_price)).split('.')[1])
         limit_price_warning = None
@@ -448,7 +685,7 @@ class Schwab(SessionManager):
 
         self.update_token(token_type='update')
 
-        data = {
+        payload = {
             "UserContext": {
                 "AccountId": str(account_id),
                 "AccountColor": 0
@@ -478,11 +715,15 @@ class Schwab(SessionManager):
             # OrderProcessingControl seems to map to verification vs actually placing an order.
             "OrderProcessingControl": 1
         }
+        if duration == 49 and expiration_date is not None:
+            payload["OrderStrategy"]["ExpirationDate"] = expiration_date
+        if side == "Buy":
+            payload["OrderStrategy"]["ReinvestDividend"] = reinvest
 
         # Adding this header seems to be necessary.
         self.headers['schwab-resource-version'] = '1.0'
 
-        r = requests.post(urls.order_verification_v2(), json=data, headers=self.headers)
+        r = requests.post(urls.order_verification_v2(), json=payload, headers=self.headers)
         if r.status_code != 200:
             return [r.text], False
 
@@ -491,13 +732,13 @@ class Schwab(SessionManager):
         order_id = response['orderStrategy']['orderId']
         first_order_leg = response['orderStrategy']['orderLegs'][0]
         if "schwabSecurityId" in first_order_leg:
-            data["OrderStrategy"]["OrderLegs"][0]["Instrument"]["ItemIssueId"] = first_order_leg["schwabSecurityId"]
+            payload["OrderStrategy"]["OrderLegs"][0]["Instrument"]["ItemIssueId"] = first_order_leg["schwabSecurityId"]
 
         messages = list()
         if limit_price_warning is not None:
             messages.append(limit_price_warning)
         for message in response["orderStrategy"]["orderMessages"]:
-            messages.append(message["message"])
+            messages.append("Severity %s: %s" % (message["severity"], message["message"]))
 
         # TODO: This needs to be fleshed out and clarified.
         if response["orderStrategy"]["orderReturnCode"] not in valid_return_codes:
@@ -507,25 +748,24 @@ class Schwab(SessionManager):
             return messages, True
 
         # Make the same POST request, but for real this time.
-        data["UserContext"]["CustomerId"] = 0
-        data["OrderStrategy"]["OrderId"] = int(order_id)
-        data["OrderProcessingControl"] = 2
+        payload["UserContext"]["CustomerId"] = 0
+        payload["OrderStrategy"]["OrderId"] = int(order_id)
+        payload["OrderProcessingControl"] = 2
         if affirm_order:
-            data["OrderStrategy"]["OrderAffrmIn"] = True
+            payload["OrderStrategy"]["OrderAffrmIn"] = True
         self.update_token(token_type='update')
-        r = requests.post(urls.order_verification_v2(), json=data, headers=self.headers)
+        r = requests.post(urls.order_verification_v2(), json=payload, headers=self.headers)
 
         if r.status_code != 200:
             return [r.text], False
 
         response = json.loads(r.text)
 
-        messages = list()
         if limit_price_warning is not None:
             messages.append(limit_price_warning)
         if "orderMessages" in response["orderStrategy"] and response["orderStrategy"]["orderMessages"] is not None:
             for message in response["orderStrategy"]["orderMessages"]:
-                messages.append(message["message"])
+                messages.append("Severity %s: %s" % (message["severity"], message["message"]))
 
         if response["orderStrategy"]["orderReturnCode"] in valid_return_codes:
             return messages, True
@@ -607,6 +847,7 @@ class Schwab(SessionManager):
                             - Quote at the time of order verification: $xx.xx
                         Verification response messages with severity 20 include at least:
                             - Insufficient settled funds (different from insufficient buying power)
+                            - Stop prices do not guarantee execution (trade) prices
                         Verification response messages with severity 25 include at least:
                             - This order is executable because the buy (or sell) limit is higher
                               (lower) than the ask (bid) price.
@@ -788,10 +1029,13 @@ class Schwab(SessionManager):
             return [r2.text], False
         return response, False
 
-    def quote_v2(self, tickers):
+    def quote_v2(self, tickers) -> {}:
         """
         quote_v2 takes a list of Tickers, and returns Quote information through the Schwab API.
         """
+        if len(tickers) == 0:
+            return [], True
+
         data = {
             "Symbols": tickers,
             "IsIra": False,
@@ -807,7 +1051,7 @@ class Schwab(SessionManager):
             return [r.text], False
 
         response = json.loads(r.text)
-        return response["quotes"]
+        return response["quotes"], True
 
     def orders_v2(self, account_id=None):
         """
@@ -819,7 +1063,7 @@ class Schwab(SessionManager):
         self.update_token(token_type='api')
         self.headers['schwab-resource-version'] = '2.0'
         if account_id:
-            self.headers["schwab-client-account"] = account_id
+            self.headers["schwab-client-account"] = str(account_id)
         r = requests.get(urls.orders_v2(), headers=self.headers)
         if r.status_code != 200:
             return [r.text], False
