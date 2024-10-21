@@ -3,7 +3,7 @@ import json
 import re
 import urllib.parse
 import requests
-from re import sub
+import sys
 
 from . import urls
 from .account_information import Position, Account
@@ -18,18 +18,21 @@ def _get_current_shares(account_summary):
 
 
 class Schwab(SessionManager):
-    def __init__(self, **kwargs):
+    def __init__(self, session_cache=None, **kwargs):
         """
-            The Schwab class. Used to interact with schwab.
+        The Schwab class. Used to interact with the Schwab API.
 
+        :type session_cache: str
+        :param session_cache: Path to an optional session file, used to save/restore credentials
         """
-        headless = kwargs.get("headless", True)
-        browser_type = kwargs.get("browser_type", "firefox")
-        super(Schwab, self).__init__(headless=headless, browser_type=browser_type)
+        self.headless = kwargs.get("headless", True)
+        self.browserType = kwargs.get("browserType", "firefox")
+        self.session_cache = session_cache
+        super(Schwab, self).__init__(headless=self.headless, browser_type=self.browserType)
 
     def get_account_info(self):
         """
-            Returns a dictionary of Account objects where the key is the account number
+        Returns a dictionary of Account objects where the key is the account number
         """
 
         account_info = dict()
@@ -64,7 +67,7 @@ class Schwab(SessionManager):
                         )._as_dict()
                     )
 
-                    if "ChildOptionPositions" not in position:
+                    if not "ChildOptionPositions" in position:
                         continue
 
                     # Add call positions if they exist
@@ -971,7 +974,8 @@ class Schwab(SessionManager):
             # The fields below are experimental and should only be changed if you know what
             # you're doing.
             instrument_type=46,
-    ):
+            order_management_system=2, # You may need to change this based on the value returned from calling orders_v2
+            ):
         """
         Cancels an open order (specified by order ID) using the v2 API
 
@@ -984,7 +988,7 @@ class Schwab(SessionManager):
         """
         data = {
             "TypeOfOrder": 0,
-            "OrderManagementSystem": 2,
+            "OrderManagementSystem": order_management_system,
             "Orders": [{
                 "OrderId": order_id,
                 "IsLiveOrder": True,
@@ -1183,10 +1187,3 @@ class Schwab(SessionManager):
 
         response = json.loads(r.text)
         return response
-
-    def update_token(self, token_type='api'):
-        r = self.session.get(f"https://client.schwab.com/api/auth/authorize/scope/{token_type}")
-        if not r.ok:
-            raise ValueError(f"Error updating Bearer token: {r.reason}")
-        token = json.loads(r.text)['token']
-        self.headers['authorization'] = f"Bearer {token}"
