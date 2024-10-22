@@ -18,7 +18,7 @@ VIEWPORT = {'width': 1920, 'height': 1080}
 
 
 class SessionManager:
-    def __init__(self, browser_type="firefox", headless=False) -> None:
+    def __init__(self, debug = False, browser_type="firefox", headless=False) -> None:
         """ 
         This class is using asynchronous playwright mode.
         """

@@ -227,7 +227,7 @@ class Schwab(SessionManager):
         prices = {}
         if success:
             for quotation in quotations:
-                prices[quotation['symbol']] = float(sub(r'[^\d.]', '', quotation['quote']['last']))
+                prices[quotation['symbol']] = float(re.sub(r'[^\d.]', '', quotation['quote']['last']))
         return prices
 
     def get_current_price(self, ticker: str) -> float:
