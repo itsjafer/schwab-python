@@ -121,13 +121,16 @@ class Schwab(SessionManager):
             return [r.text], False
         return json.loads(r.text)
 
-    def trade(self, ticker, side, qty, account_id, dry_run=True):
+    def trade(self, ticker, side, qty, account_id, dry_run=True, reinvest=True, tax_optimized_cost_basis=True):
         """
-            ticker (Str) - The symbol you want to trade,
+            ticker (str) - The ticker symbol to trade,
             side (str) - Either 'Buy' or 'Sell',
-            qty (int) - The amount of shares to buy/sell,
+            qty (float) - The amount of shares to buy/sell,
             account_id (int) - The account ID to place the trade on. If the ID is XXXX-XXXX,
-                         we're looking for just XXXXXXXX.
+                         we're looking for just XXXXXXXX,
+            dry_run (bool) - Dry run, don't actually perform trades,
+            reinvest (bool) - Reinvest dividends,
+            tax_optimized_cost_basis (bool) - Use tax optimized cost-basis strategy, as opposed to FIFO.
 
             Returns messages (list of strings), is_success (boolean)
         """
@@ -139,19 +142,22 @@ class Schwab(SessionManager):
         else:
             raise Exception("side must be either Buy or Sell")
 
+        cost_basis_method = 'BTAX' if tax_optimized_cost_basis else 'FIFO'
+
         data = {
             "IsMinQty":False,
             "CustomerId":str(account_id),
             "BuySellCode":buySellCode,
             "Quantity":str(qty),
-            "IsReinvestDividends":False,
             "SecurityId":ticker,
             "TimeInForce":"1", # Day Only
             "OrderType":1, # Market Order
-            "CblMethod":"FIFO",
-            "CblDefault":"FIFO",
-            "CostBasis":"FIFO",
-            }
+            "CblMethod": cost_basis_method,
+            "CblDefault": cost_basis_method,
+            "CostBasis": cost_basis_method,
+        }
+        if side == "Buy":
+            data["IsReinvestDividends"] = reinvest
 
         r = self.session.post(urls.order_verification(), data)
 
@@ -167,13 +173,15 @@ class Schwab(SessionManager):
         if dry_run:
             return messages, True
 
+        short_description = urllib.parse.quote_plus(response['IssueShortDescription']) \
+            if response['IssueShortDescription'] is not None else ''
         data = {
             "AccountId": str(account_id),
             "ActionType": side,
             "ActionTypeText": side,
             "BuyAction": side == "Buy",
-            "CostBasis": "FIFO",
-            "CostBasisMethod": "FIFO",
+            "CostBasis": cost_basis_method,
+            "CostBasisMethod": cost_basis_method,
             "IsMarketHours": True,
             "ItemIssueId": int(response['IssueId']),
             "NetAmount": response['NetAmount'],
@@ -181,7 +189,7 @@ class Schwab(SessionManager):
             "OrderType": "Market",
             "Principal": response['QuoteAmount'],
             "Quantity": str(qty),
-            "ShortDescription": urllib.parse.quote_plus(response['IssueShortDescription']),
+            "ShortDescription": short_description,
             "Symbol": response["IssueSymbol"],
             "Timing": "Day Only"
         }
@@ -193,6 +201,9 @@ class Schwab(SessionManager):
             return messages, False
 
         response = json.loads(r.text)
+        for message in response["Messages"]:
+            messages.append(message["Message"])
+
         if response["ReturnCode"] == 0:
             return messages, True
 
@@ -207,12 +218,14 @@ class Schwab(SessionManager):
         # The Fields below are experimental fields that should only be changed if you know what you're doing.
         order_type=49,
         duration=48,
-        limit_price=0,
-        stop_price=0,
+        limit_price=0.0,
+        stop_price=0.0,
         primary_security_type=46,
-        valid_return_codes = {0,10},
+        valid_return_codes=None,  # Set to {0, 10} below
         affirm_order=False,
-        costBasis='FIFO'
+        costBasis='FIFO',
+        reinvest=False,
+        expiration_date=None
         ):
         """
             ticker (Str) - The symbol you want to trade,
@@ -277,12 +290,16 @@ class Schwab(SessionManager):
                         'LIFO': Last In First Out
                         'BTAX': Tax Lot Optimizer
                         ('VSP': Specific Lots -> just for reference. Not implemented: Requires to select lots manually.)
+            reinvest - if purchasing, reinvest dividends that occur into the same equity, by default False
+            expiration_date - Required when duration is 49 - GTC Good till canceled. Of the form 'mm/dd/YYYY'
             Note: this function calls the new Schwab API, which is flakier and seems to have stricter authentication requirements.
             For now, only use this function if the regular trade function doesn't work for your use case.
 
             Returns messages (list of strings), is_success (boolean)
         """
 
+        if valid_return_codes is None:
+            valid_return_codes = {0, 10}
         if side == "Buy":
             buySellCode = "49"
         elif side == "Sell":
@@ -336,6 +353,10 @@ class Schwab(SessionManager):
             # OrderProcessingControl seems to map to verification vs actually placing an order.
             "OrderProcessingControl":1
         }
+        if duration == 49 and expiration_date is not None:
+            data["OrderStrategy"]["ExpirationDate"] = expiration_date
+        if side == "Buy":
+            data["OrderStrategy"]["ReinvestDividend"] = reinvest
 
         # Adding this header seems to be necessary.
         self.headers['schwab-resource-version'] = '1.0'
@@ -355,7 +376,7 @@ class Schwab(SessionManager):
         if limit_price_warning is not None:
             messages.append(limit_price_warning)
         for message in response["orderStrategy"]["orderMessages"]:
-            messages.append(message["message"])
+            messages.append("Severity %s: %s" % (message["severity"], message["message"]))
 
         # TODO: This needs to be fleshed out and clarified.
         if response["orderStrategy"]["orderReturnCode"] not in valid_return_codes:
@@ -378,12 +399,11 @@ class Schwab(SessionManager):
 
         response = json.loads(r.text)
 
-        messages = list()
         if limit_price_warning is not None:
             messages.append(limit_price_warning)
         if "orderMessages" in response["orderStrategy"] and response["orderStrategy"]["orderMessages"] is not None:
             for message in response["orderStrategy"]["orderMessages"]:
-                messages.append(message["message"])
+                messages.append("Severity %s: %s" % (message["severity"], message["message"]))
 
         if response["orderStrategy"]["orderReturnCode"] in valid_return_codes:
             return messages, True
@@ -402,7 +422,7 @@ class Schwab(SessionManager):
         duration=48,
         limit_price=0,
         stop_price=0,
-        valid_return_codes = {0,10},
+        valid_return_codes=None,
         affirm_order=False
         ):
         """
@@ -465,6 +485,7 @@ class Schwab(SessionManager):
                             - Quote at the time of order verification: $xx.xx
                         Verification response messages with severity 20 include at least:
                             - Insufficient settled funds (different from insufficient buying power)
+                            - Stop prices do not guarantee execution (trade) prices
                         Verification response messages with severity 25 include at least:
                             - This order is executable because the buy (or sell) limit is higher
                               (lower) than the ask (bid) price.
@@ -486,6 +507,8 @@ class Schwab(SessionManager):
 
             Returns messages (list of strings), is_success (boolean)
         """
+        if valid_return_codes is None:
+            valid_return_codes = {0, 10}
         if not (len(quantities) == len(symbols) and len(symbols) == len(instructions)):
             raise ValueError("variables quantities, symbols and instructions must have the same length")
 
@@ -648,6 +671,9 @@ class Schwab(SessionManager):
         """
         quote_v2 takes a list of Tickers, and returns Quote information through the Schwab API.
         """
+        if len(tickers) == 0:
+            return [], True
+
         data = {
             "Symbols":tickers,
             "IsIra":False,
@@ -663,7 +689,7 @@ class Schwab(SessionManager):
             return [r.text], False
 
         response = json.loads(r.text)
-        return response["quotes"]
+        return response["quotes"], True
 
     def orders_v2(self, account_id=None):
         """
@@ -675,7 +701,7 @@ class Schwab(SessionManager):
         self.update_token(token_type='api')
         self.headers['schwab-resource-version'] = '2.0'
         if account_id:
-            self.headers["schwab-client-account"] = account_id
+            self.headers["schwab-client-account"] = str(account_id)
         r = requests.get(urls.orders_v2(), headers=self.headers)
         if r.status_code != 200:
             return [r.text], False
