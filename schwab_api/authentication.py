@@ -14,17 +14,17 @@ from requests.cookies import cookiejar_from_dict
 
 # Constants
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:{version}) Gecko/20100101 Firefox/"
-VIEWPORT = {'width': 1920, 'height': 1080}
-
+VIEWPORT = { 'width': 1920, 'height': 1080 }
 
 class SessionManager:
-    def __init__(self, debug = False, browser_type="firefox", headless=False) -> None:
-        """ 
-        This class is using asynchronous playwright mode.
+    def __init__(self, debug = False) -> None:
         """
-        self.browserType = browser_type
-        self.headless = headless
-        self.headers = None
+        This class is using asynchronous playwright mode.
+
+        :type debug: boolean
+        :param debug: Enable debug logging
+        """
+        self.headers = {}
         self.session = requests.Session()
         self.playwright = None
         self.browser = None
@@ -164,9 +164,7 @@ class SessionManager:
 
         try:
             await self.page.frame(name=login_frame).press("[placeholder=\"Password\"]", "Enter")
-            # Making it more robust than specifying an exact url which may change.
-            await self.page.wait_for_url(re.compile(r"app/trade"),
-                                         wait_until="domcontentloaded")
+            await self.page.wait_for_url(re.compile(r"app/trade"), wait_until="domcontentloaded") # Making it more robust than specifying an exact url which may change.
         except TimeoutError:
             raise Exception("Login was not successful; please check username and password")
 

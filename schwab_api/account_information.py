@@ -1,6 +1,5 @@
 class Account(dict):
     def __init__(self, account_id, positions, market_value, available_cash, account_value, cost_basis):
-        super().__init__()
         self.account_id = account_id
         self.positions = positions
         self.market_value = market_value
@@ -24,10 +23,8 @@ class Account(dict):
     def __str__(self) -> str:
         return str(self._as_dict())
 
-
 class Position(dict):
     def __init__(self, symbol, description, quantity, cost, market_value, security_id):
-        super().__init__()
         self.symbol = symbol
         self.description = description
         self.quantity = quantity
